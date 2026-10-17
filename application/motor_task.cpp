@@ -32,7 +32,7 @@ constexpr float CONTROL_DT = 0.002f;
 
 // 待整定：先调 P，再逐步加入 I，初期 D 可保持为零。
 constexpr float SPEED_KP = 0.8f;
-constexpr float SPEED_KI = 0.0f;
+constexpr float SPEED_KI = 0.1f;
 constexpr float SPEED_KD = 0.0f;
 
 // 待配置：PID 输出是输出轴力矩，单位 N·m。
@@ -133,6 +133,196 @@ float apply_deadzone(float value)
 
   return (value + STICK_DEADZONE) / (1.0f - STICK_DEADZONE);
 }
+// ---------- 自动前进的位置外环 ----------
+
+constexpr float AUTO_DISTANCE = 3.0f;        // 目标距离，m
+constexpr float AUTO_MAX_SPEED = 1.2f;       // 自动移动最大速度，m/s
+constexpr float AUTO_DISTANCE_TOL = 0.02f;   // 到达距离容差，m
+constexpr float AUTO_STOP_SPEED = 0.03f;     // 判定停稳的轮缘速度，m/s
+constexpr uint32_t AUTO_SETTLE_MS = 300;     // 连续满足到达条件的时间
+constexpr uint32_t AUTO_TIMEOUT_MS = 30000;  // 自动任务超时，ms
+
+// 输出是底盘速度 m/s，不是力矩！
+// 第一版先使用 P 控制，参数需要实测调整。
+sp::PID position_pid(
+  CONTROL_DT,      // dt：控制周期，s
+  1.2f,            // kp：位置误差 m → 速度 m/s
+  0.0f,            // ki：初期不加积分
+  0.0f,            // kd：初期不加微分
+  AUTO_MAX_SPEED,  // max_out：最大前进/后退速度，m/s
+  0.0f,            // max_iout：积分输出限幅
+  1.0f,            // alpha
+  false,           // angular：距离不做角度环绕
+  false            // dynamic
+);
+
+enum class AutoState
+{
+  IDLE,
+  RUNNING,
+  DONE,
+  FAULT
+};
+
+AutoState auto_state = AutoState::IDLE;
+bool auto_armed = false;
+
+float auto_start_angle[MOTOR_COUNT] = {};
+float auto_distance = 0.0f;
+
+uint32_t auto_start_ms = 0;
+uint32_t auto_settle_start_ms = 0;
+bool auto_settling = false;
+
+// 取消自动任务，且必须重新准备后才能启动。
+void auto_reset()
+{
+  auto_state = AutoState::IDLE;
+  auto_armed = false;
+  auto_settling = false;
+  auto_distance = 0.0f;
+  position_pid.clear();
+}
+
+// 返回 false：本周期必须零力矩输出。
+// 返回 true：继续使用下面的四轮速度控制。
+// 手动模式下不修改 vx、vy、wz。
+bool auto_update(float & vx, float & vy, float & wz)
+{
+  const uint32_t now_ms = osKernelSysTick();
+  const auto left_switch = remote.sw_l;
+
+  if (left_switch != sp::DBusSwitchMode::UP) {
+    // 离开正在运行、已完成或故障的自动模式：
+    // 清除状态，下一次必须重新经过左下档准备。
+    if (auto_state != AutoState::IDLE) {
+      position_pid.clear();
+      auto_armed = false;
+
+      for (int i = 0; i < MOTOR_COUNT; ++i) {
+        speed_pid[i].clear();
+      }
+    }
+
+    auto_state = AutoState::IDLE;
+    auto_settling = false;
+
+    // 左下档置位；经过中档时保留准备标志。
+    if (left_switch == sp::DBusSwitchMode::DOWN) {
+      auto_armed = true;
+    }
+
+    return true;
+  }
+
+  // 左上档属于自动模式，不接受摇杆或拨轮的运动指令。
+  vx = 0.0f;
+  vy = 0.0f;
+  wz = 0.0f;
+
+  // 上电时就处于左上档，不能直接起跑。
+  if (auto_state == AutoState::IDLE && !auto_armed) {
+    return false;
+  }
+
+  // 读取多圈角度及轮速快照。
+  float angle[MOTOR_COUNT];
+  float wheel_speed[MOTOR_COUNT];
+  bool feedback_ok = true;
+
+  for (int i = 0; i < MOTOR_COUNT; ++i) {
+    angle[i] = motors[i].angle;
+    wheel_speed[i] = motors[i].speed;
+
+    if (!motors[i].is_alive(now_ms)) {
+      feedback_ok = false;
+    }
+  }
+
+  // 自动测距不能使用过期的电机反馈。
+  if (!feedback_ok) {
+    auto_state = AutoState::FAULT;
+    auto_armed = false;
+    position_pid.clear();
+    return false;
+  }
+
+  if (auto_state == AutoState::FAULT) {
+    return false;
+  }
+
+  // 第一次进入自动模式：记录当前位置为起点。
+  if (auto_state == AutoState::IDLE) {
+    for (int i = 0; i < MOTOR_COUNT; ++i) {
+      auto_start_angle[i] = angle[i];
+      speed_pid[i].clear();
+    }
+
+    position_pid.clear();
+    auto_distance = 0.0f;
+    auto_start_ms = now_ms;
+    auto_settling = false;
+    auto_armed = false;
+    auto_state = AutoState::RUNNING;
+  }
+
+  // 四轮向前行驶距离的平均值。
+  // motors.angle 已经除过减速比，不能再次除以 13.7。
+  auto_distance = 0.0f;
+  float max_wheel_speed = 0.0f;
+
+  for (int i = 0; i < MOTOR_COUNT; ++i) {
+    auto_distance +=
+      MOTOR_DIRECTION[i] * (angle[i] - auto_start_angle[i]) * WHEEL_RADIUS / MOTOR_COUNT;
+
+    const float speed_abs = std::abs(wheel_speed[i] * WHEEL_RADIUS);
+
+    if (speed_abs > max_wheel_speed) {
+      max_wheel_speed = speed_abs;
+    }
+  }
+
+  // 完成后维持零速闭环，不重复启动。
+  if (auto_state == AutoState::DONE) {
+    return true;
+  }
+
+  if (now_ms - auto_start_ms >= AUTO_TIMEOUT_MS) {
+    auto_state = AutoState::FAULT;
+    position_pid.clear();
+    return false;
+  }
+
+  const float error = AUTO_DISTANCE - auto_distance;
+
+  if (std::abs(error) <= AUTO_DISTANCE_TOL) {
+    // 进入距离容差后，先让速度环制动至零速。
+    vx = 0.0f;
+    position_pid.clear();
+
+    if (max_wheel_speed <= AUTO_STOP_SPEED) {
+      if (!auto_settling) {
+        auto_settling = true;
+        auto_settle_start_ms = now_ms;
+      }
+
+      if (now_ms - auto_settle_start_ms >= AUTO_SETTLE_MS) {
+        auto_state = AutoState::DONE;
+      }
+    }
+    else {
+      auto_settling = false;
+    }
+  }
+  else {
+    auto_settling = false;
+
+    position_pid.calc(AUTO_DISTANCE, auto_distance);
+    vx = position_pid.out;
+  }
+
+  return true;
+}
 }  // namespace
 
 // 由 can_task 调用，生成控制数据，不负责发送 CAN。
@@ -154,6 +344,7 @@ void motor_make_frame(uint8_t * data)
 
   // 下档、上档或遥控器掉线：直接零力矩，不运行零速闭环。
   if (!enabled) {
+    auto_reset();  // 新增：取消自动任务，清除位置环状态
     for (int i = 0; i < MOTOR_COUNT; ++i) {
       speed_pid[i].clear();
       motors[i].cmd(0.0f);
@@ -187,6 +378,17 @@ void motor_make_frame(uint8_t * data)
     wz = -ROTATION_SPEED;  // 向右拨：顺时针，目标 1 rad/s
   }
 
+  // 自动模式用位置外环生成 vx，同时将 vy、wz 设为零。
+  // 手动模式保持原来的摇杆控制。
+  if (!auto_update(vx, vy, wz)) {
+    for (int i = 0; i < MOTOR_COUNT; ++i) {
+      speed_pid[i].clear();
+      motors[i].cmd(0.0f);
+      motors[i].write(data);
+    }
+
+    return;
+  }
   // 旋转产生的轮速分量，单位 m/s。
   const float rotation = ROTATION_LEVER * wz;
 
