@@ -62,7 +62,7 @@ osThreadId plottertaskHandle;
 void StartDefaultTask(void const * argument);
 extern void led_task(void const * argument);
 extern void buzzer_task(void const * argument);
-extern void dbus_task(void const * argument);
+extern void uart_task(void const * argument);
 extern void can_task(void const * argument);
 extern void plotter_task(void const * argument);
 
@@ -125,7 +125,7 @@ void MX_FREERTOS_Init(void) {
   buzzertaskHandle = osThreadCreate(osThread(buzzertask), NULL);
 
   /* definition and creation of dbustask */
-  osThreadDef(dbustask, dbus_task, osPriorityNormal, 0, 256);
+  osThreadDef(dbustask, uart_task, osPriorityNormal, 0, 256);
   dbustaskHandle = osThreadCreate(osThread(dbustask), NULL);
 
   /* definition and creation of cantask */
