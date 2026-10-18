@@ -8,7 +8,7 @@ sp::Buzzer buzzer(&htim4, TIM_CHANNEL_3, 84e6);
 // 达妙
 // sp::Buzzer buzzer(&htim12, TIM_CHANNEL_2, 240e6);
 
-extern "C" void buzzer_task(void const *argument)
+extern "C" void buzzer_task()
 {
   buzzer.set(5000, 0.1);
 
