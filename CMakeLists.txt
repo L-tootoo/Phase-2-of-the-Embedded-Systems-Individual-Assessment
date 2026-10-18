@@ -60,8 +60,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     sp_middleware/io/plotter/plotter.cpp
     
     sp_middleware/tools/pid/pid.cpp # <- 添加这一行
-     sp_middleware/tools/math_tools/math_tools.cpp
-
+    sp_middleware/tools/math_tools/math_tools.cpp
+    sp_middleware/referee/pm02/pm02.cpp # <- 添加这一行
+    sp_middleware/tools/crc/crc.cpp # <- 添加这一行
 )
 
 # Add include paths
@@ -84,3 +85,4 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 
     # Add user defined libraries
 )
+

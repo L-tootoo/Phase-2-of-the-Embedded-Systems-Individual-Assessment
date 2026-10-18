@@ -116,7 +116,26 @@ sp::PID speed_pid[MOTOR_COUNT] = {
     false,         // angular：不启用角度环绕处理
     false          // dynamic：不启用动态积分
   }};
+constexpr float k1 = 3.066786f;
+constexpr float k2 = 0.01515196f;
+constexpr float a = 3.996536f;
 
+// 输入：四轮力矩指令 N·m，四轮实际角速度 rad/s。
+// 返回：四轮预测总输入功率 W。
+float calculate_power(const float torque[MOTOR_COUNT], const float speed[MOTOR_COUNT])
+{
+  float mechanical_power = 0.0f;
+  float torque_squared_sum = 0.0f;
+  float speed_squared_sum = 0.0f;
+
+  for (int i = 0; i < MOTOR_COUNT; ++i) {
+    mechanical_power += torque[i] * speed[i];
+    torque_squared_sum += torque[i] * torque[i];
+    speed_squared_sum += speed[i] * speed[i];
+  }
+
+  return mechanical_power + k1 * torque_squared_sum + k2 * speed_squared_sum + a;
+}
 // 死区内输出零；死区外连续映射到 [-1, 1]。
 float apply_deadzone(float value)
 {
@@ -466,4 +485,34 @@ void motor_get_pid_debug(int motor_id, float data[4])
   data[1] = motors[index].speed;         // 实际速度，rad/s
   data[2] = speed_pid[index].out;        // PID 输出，N·m
   data[3] = speed_pid[index].data.iout;  // 积分输出，N·m
+}
+// 顺序：ID1转矩、ID1速度、ID2转矩、ID2速度……
+// 转矩：N·m；角速度：rad/s。
+void motor_get_axis_data(float data[8])
+{
+  taskENTER_CRITICAL();
+
+  for (int i = 0; i < MOTOR_COUNT; ++i) {
+    data[2 * i] = motors[i].torque;
+    data[2 * i + 1] = motors[i].speed;
+  }
+
+  taskEXIT_CRITICAL();
+}
+// 供 Plotter 调用：使用当前 PID 力矩指令和实际轮速预测功率。
+float motor_get_predicted_power()
+{
+  float torque[MOTOR_COUNT];
+  float speed[MOTOR_COUNT];
+
+  taskENTER_CRITICAL();
+
+  for (int i = 0; i < MOTOR_COUNT; ++i) {
+    torque[i] = speed_pid[i].out;
+    speed[i] = motors[i].speed;
+  }
+
+  taskEXIT_CRITICAL();
+
+  return calculate_power(torque, speed);
 }
