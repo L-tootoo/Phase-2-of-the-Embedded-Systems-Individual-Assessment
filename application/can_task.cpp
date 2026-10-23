@@ -21,6 +21,7 @@ struct PowerMeterData
 
   uint32_t last_update_ms = 0;
   bool received = false;
+  uint32_t sequence = 0;  // 每收到一帧有效功率计报文加一。
 };
 
 PowerMeterData power_meter;
@@ -47,6 +48,7 @@ void power_meter_receive(const uint8_t * data, uint32_t now_ms)
   // data[6]、data[7] 为保留字节，不参与计算。
   power_meter.last_update_ms = now_ms;
   power_meter.received = true;
+  ++power_meter.sequence;
 }
 }  // namespace
 
@@ -121,4 +123,18 @@ extern "C" void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef * hcan)
       motor_receive(header.StdId, data, now_ms);
     }
   }
+}
+// 接收时间不是功率计内部采样时间，不能据此消除其内部延迟。
+bool power_meter_get_fit_snapshot(float data[3], uint32_t & stamp_ms, uint32_t & sequence)
+{
+  taskENTER_CRITICAL();
+  data[0] = power_meter.current;
+  data[1] = power_meter.voltage;
+  data[2] = power_meter.power;
+  stamp_ms = power_meter.last_update_ms;
+  sequence = power_meter.sequence;
+  const bool alive =
+    power_meter.received && (osKernelSysTick() - stamp_ms < POWER_METER_TIMEOUT_MS);
+  taskEXIT_CRITICAL();
+  return alive;
 }

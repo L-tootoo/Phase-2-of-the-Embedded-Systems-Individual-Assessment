@@ -24,14 +24,14 @@ enum MotorIndex
 
 constexpr float REDUCTION_RATIO = 13.7f;
 constexpr float WHEEL_RADIUS = 0.077f;  // 轮半径，m
-constexpr float MAX_SPEED = 0.5f;       // 最大平移速度，m/s，初期低速调试
+constexpr float MAX_SPEED = 1.3f;       // 最大平移速度，m/s，初期低速调试
 constexpr float STICK_DEADZONE = 0.05f;
 
 // 当前 can_task 使用 osDelay(2)，这里暂按名义周期 2 ms 设置。
 constexpr float CONTROL_DT = 0.002f;
 
 // 待整定：先调 P，再逐步加入 I，初期 D 可保持为零。
-constexpr float SPEED_KP = 0.8f;
+constexpr float SPEED_KP = 1.0f;
 constexpr float SPEED_KI = 0.1f;
 constexpr float SPEED_KD = 0.0f;
 
@@ -116,8 +116,8 @@ sp::PID speed_pid[MOTOR_COUNT] = {
     false,         // angular：不启用角度环绕处理
     false          // dynamic：不启用动态积分
   }};
-constexpr float k1 = 3.066786f;
-constexpr float k2 = 0.01515196f;
+constexpr float k1 = 2.0f;
+constexpr float k2 = 0.01f;
 constexpr float a = 3.996536f;
 
 // 输入：四轮力矩指令 N·m，四轮实际角速度 rad/s。
@@ -354,6 +354,7 @@ float power_debug[5] = {};
 
 // 模型诊断快照：指令3项、反馈3项、时间s、状态、缩放、上限、有效标志。
 float power_terms_data[11] = {};
+uint32_t power_terms_stamp_ms = 0;
 uint32_t power_terms_origin_ms = 0;
 bool power_terms_clock_started = false;
 
@@ -370,6 +371,7 @@ void publish_power_terms(
     power_terms_data[i] = command[i];
     power_terms_data[i + 3] = feedback[i];
   }
+  power_terms_stamp_ms = stamp_ms;
   power_terms_data[6] = static_cast<float>(stamp_ms - power_terms_origin_ms) * 0.001f;
   power_terms_data[7] = status;
   power_terms_data[8] = scale;
@@ -585,12 +587,27 @@ void motor_make_frame(uint8_t * data)
 
   target_speed[FRONT_RIGHT] = (vx - vy + ROTATION_LEVER * wz) / WHEEL_RADIUS;  // ID 4
 
-  // 读取四轮输出轴角速度，单位 rad/s。
-  float measured_speed[MOTOR_COUNT];
+  // 本控制周期统一使用这份电机反馈快照。
+  // speed：输出轴角速度，rad/s。
+  // torque：输出轴转矩，N·m。
+  float measured_speed[MOTOR_COUNT] = {};
+  float feedback_torque[MOTOR_COUNT] = {};
+  bool feedback_alive = true;
+
+  taskENTER_CRITICAL();
+
+  const uint32_t compare_now_ms = osKernelSysTick();
 
   for (int i = 0; i < MOTOR_COUNT; ++i) {
     measured_speed[i] = motors[i].speed;
+    feedback_torque[i] = motors[i].torque;
+
+    if (!motors[i].is_alive(compare_now_ms)) {
+      feedback_alive = false;
+    }
   }
+
+  taskEXIT_CRITICAL();
 
   float target_torque[MOTOR_COUNT] = {};
 
@@ -644,39 +661,25 @@ void motor_make_frame(uint8_t * data)
     }
   }
 
-  // 6. 发布数据。
-  publish_power_debug(power_before, power_after, power_scale, power_limit, status);
-
-  // 比较同一份反馈速度下，最终力矩指令与反馈转矩的模型功率。
-  // 使用 target_torque，避免 PID clear() 后读到零，也避免使用限幅前指令。
-  float feedback_torque[MOTOR_COUNT];
-  float feedback_speed[MOTOR_COUNT];
-  bool feedback_alive = true;
-
-  taskENTER_CRITICAL();
-  const uint32_t compare_now_ms = osKernelSysTick();
-  for (int i = 0; i < MOTOR_COUNT; ++i) {
-    feedback_torque[i] = motors[i].torque;
-    feedback_speed[i] = motors[i].speed;
-    if (!motors[i].is_alive(compare_now_ms)) {
-      feedback_alive = false;
-    }
-  }
-  taskEXIT_CRITICAL();
-
-  const float command_model_power = calculate_power(target_torque, feedback_speed);
-  const float feedback_model_power = calculate_power(feedback_torque, feedback_speed);
+  // 6. PID、限制器和诊断统一使用本周期的反馈快照。
+  // 指令预测直接使用限制器计算的结果，避免再次读取速度产生差异。
+  const float command_model_power = power_after;
+  const float feedback_model_power = calculate_power(feedback_torque, measured_speed);
   const bool compare_valid = feasible && feedback_alive && std::isfinite(command_model_power) &&
                              std::isfinite(feedback_model_power);
 
-  publish_power_compare(command_model_power, feedback_model_power, compare_valid);
+  float command_terms[3] = {};
+  float feedback_terms[3] = {};
+  calculate_power_terms(target_torque, measured_speed, command_terms);
+  calculate_power_terms(feedback_torque, measured_speed, feedback_terms);
 
-  float command_terms[3];
-  float feedback_terms[3];
-  calculate_power_terms(target_torque, feedback_speed, command_terms);
-  calculate_power_terms(feedback_torque, feedback_speed, feedback_terms);
+  // 整组发布；各 publish 函数内部的任务临界区允许嵌套。
+  taskENTER_CRITICAL();
+  publish_power_debug(power_before, power_after, power_scale, power_limit, status);
+  publish_power_compare(command_model_power, feedback_model_power, compare_valid);
   publish_power_terms(
     command_terms, feedback_terms, compare_now_ms, status, power_scale, power_limit, compare_valid);
+  taskEXIT_CRITICAL();
 
   // 7. 最后才发送限制后的力矩。
   for (int i = 0; i < MOTOR_COUNT; ++i) {
@@ -775,5 +778,14 @@ void motor_get_power_terms(float data[11])
   for (int i = 0; i < 11; ++i) {
     data[i] = power_terms_data[i];
   }
+  taskEXIT_CRITICAL();
+}
+
+// 诊断扩展：返回与特征快照对应的系统时间。只从任务调用。
+void motor_get_power_fit_snapshot(float data[11], uint32_t & stamp_ms)
+{
+  taskENTER_CRITICAL();
+  for (int i = 0; i < 11; ++i) data[i] = power_terms_data[i];
+  stamp_ms = power_terms_stamp_ms;
   taskEXIT_CRITICAL();
 }
